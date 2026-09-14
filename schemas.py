@@ -1,7 +1,7 @@
 from datetime import datetime
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
 class Role(str, Enum):
@@ -10,6 +10,8 @@ class Role(str, Enum):
 
 
 class ChatMessage(BaseModel):
+    """What the LLM sees: role and text only."""
+
     role: Role
     content: str
 
@@ -21,6 +23,8 @@ class ConversationOut(BaseModel):
 
 
 class MessageOut(BaseModel):
+    """What the UI and database use, including ids and timestamps."""
+
     id: str
     conversation_id: str
     role: Role
@@ -28,11 +32,6 @@ class MessageOut(BaseModel):
     timestamp: datetime
 
 
-class ChatRequest(BaseModel):
-    conversation_id: str
-    message: str = Field(min_length=1)
-
-
-class ChatResponse(BaseModel):
-    conversation_id: str
-    content: str
+class PricePoint(BaseModel):
+    date: str
+    close: float

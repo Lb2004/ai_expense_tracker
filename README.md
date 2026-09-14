@@ -1,6 +1,6 @@
-# Chatbot demo
+# StockBot
 
-Minimal Streamlit chatbot using Pydantic AI, SQLAlchemy, and SQLite. LLM calls are isolated in `llm_client.py` so an MCP client/server can be added later without changing the UI or database layers.
+Streamlit chatbot using Pydantic AI (Google Gemini), SQLAlchemy, and SQLite. Yahoo Finance calls live in `stock_data.py` so they can later be wrapped by an MCP server; `llm_client.py` can then call that server instead of importing `stock_data` directly.
 
 ## Setup
 
@@ -14,7 +14,7 @@ pip install -r requirements.txt
 
 On macOS/Linux, activate with `source .venv/bin/activate`.
 
-2. Copy the example env file and set your LLM credentials. Do not commit `.env`.
+2. Copy the example env file and set your Gemini API key. Do not commit `.env`.
 
 ```bash
 copy .env.example .env
@@ -22,15 +22,11 @@ copy .env.example .env
 
 On macOS/Linux: `cp .env.example .env`
 
-Edit `.env`:
-
 ```
-LLM_API_KEY=sk-your-openai-api-key
-LLM_MODEL=gpt-4o-mini
+LLM_API_KEY=your-google-api-key
+LLM_MODEL=gemini-3.8-flash
 DATABASE_URL=sqlite:///./chatbot.db
 ```
-
-`LLM_MODEL` is passed to Pydantic AI's OpenAI chat model (Chat Completions API).
 
 ## Run
 
@@ -38,16 +34,17 @@ DATABASE_URL=sqlite:///./chatbot.db
 streamlit run app.py
 ```
 
-The app creates `chatbot.db` on first launch (unless you change `DATABASE_URL`). Use the sidebar to open past conversations or start a new one. User and assistant messages are stored in SQLite; the assistant reply is streamed token-by-token in the main pane.
+The app creates `chatbot.db` on first launch. Use the sidebar to open past conversations or start a new one. Replies stream in the main pane.
 
 ## Layout
 
 | File | Role |
 | --- | --- |
 | `app.py` | Streamlit UI |
-| `config.py` | `pydantic-settings` config from `.env` |
-| `database.py` | SQLAlchemy engine, session, `Base` |
-| `models.py` | `Conversation` and `Message` ORM models |
-| `schemas.py` | Pydantic message/request/response models |
-| `llm_client.py` | Pydantic AI agent + streaming (no UI/DB imports) |
-| `repository.py` | Conversation/message persistence |
+| `config.py` | Settings from `.env` |
+| `database.py` | Engine, `db_session`, `Base` |
+| `models.py` | Conversation and Message tables |
+| `schemas.py` | Pydantic models shared by UI, DB, and LLM |
+| `repository.py` | Conversation and message persistence |
+| `stock_data.py` | Yahoo Finance (future MCP server) |
+| `llm_client.py` | Pydantic AI agent + streaming (future MCP client) |

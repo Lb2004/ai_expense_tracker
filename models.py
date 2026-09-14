@@ -24,6 +24,11 @@ class Conversation(Base):
         default=_utcnow,
         nullable=False,
     )
+    title: Mapped[str] = mapped_column(
+        String(64),
+        default="New conversation",
+        nullable=False,
+    )
 
     messages: Mapped[list["Message"]] = relationship(
         back_populates="conversation",
