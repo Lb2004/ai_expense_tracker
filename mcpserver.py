@@ -8,7 +8,7 @@ mcp = MCPServer("stock-server")
 
 
 @mcp.tool()
-async def get_stock_price(ticker: str) -> float | str:
+async def get_stock_price(ticker: str) -> float:
     """Last closing price on the latest daily bar (not a live tick)."""
     ticker = ticker.strip().upper()
 
@@ -23,7 +23,7 @@ async def get_stock_price(ticker: str) -> float | str:
 
 
 @mcp.tool()
-async def get_price_history(ticker: str, days: int) -> list[PricePoint] | str:
+async def get_price_history(ticker: str, days: int) -> list[PricePoint]:
     """Daily closing prices for the past `days` days."""
     ticker = ticker.strip().upper()
 
@@ -48,13 +48,15 @@ async def compare_stocks(ticker_a: str, ticker_b: str) -> str:
     ticker_a = ticker_a.strip().upper()
     ticker_b = ticker_b.strip().upper()
 
-    price_a = await get_stock_price(ticker_a)
-    if isinstance(price_a, str):
-        return price_a
+    try:
+        price_a = await get_stock_price(ticker_a)
+    except Exception as exc:
+        return f"Could not retrieve price for {ticker_a}: {exc}"
 
-    price_b = await get_stock_price(ticker_b)
-    if isinstance(price_b, str):
-        return price_b
+    try:
+        price_b = await get_stock_price(ticker_b)
+    except Exception as exc:
+        return f"Could not retrieve price for {ticker_b}: {exc}"
 
     if price_a > price_b:
         return f"{ticker_a} (${price_a:.2f}) is higher than {ticker_b} (${price_b:.2f})"
@@ -83,4 +85,4 @@ async def moving_average(ticker: str, days: int, window: int) -> float:
 
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    mcp.run(transport="streamable-http", port=8000)

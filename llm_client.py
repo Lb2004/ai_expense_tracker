@@ -1,8 +1,6 @@
 import os
-import mcpserver
 from collections.abc import Iterator, Sequence
 from functools import lru_cache
-from pathlib import Path
 
 os.environ.setdefault("PYDANTIC_AI_NO_BANNER", "1")
 
@@ -10,14 +8,17 @@ from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, UserPromptPart
 from pydantic_ai.models.google import GoogleModel
 from pydantic_ai.providers.google import GoogleProvider
-from pydantic_ai.mcp import MCPToolset
-
+from pydantic_ai.mcp import MCPToolset, FastMCPClient
+from pydantic_ai.toolsets import FilteredToolset
 
 from config import Settings, get_settings
 from schemas import ChatMessage, Role
 
-# Absolute path so the subprocess can be spawned from any working directory.
-_MCP_SERVER_PATH = str(Path(__file__).parent / "mcpserver.py")
+AllowedAlphavantageTools = {"TOOL_LIST", "TOOL_GET", "TOOL_CALL"}
+
+
+def _only_discovery_tools(ctx, tool_def) -> bool:
+    return tool_def.name in AllowedAlphavantageTools
 
 
 def _build_agent(settings: Settings) -> Agent:
@@ -31,20 +32,38 @@ def _build_agent(settings: Settings) -> Agent:
         provider=GoogleProvider(api_key=settings.llm_api_key),
     )
 
-    # Each agent run spawns mcpserver.py over stdio and tears it down when done.
-    toolset = MCPToolset(mcpserver.mcp)
+    # Connects to mcpserver.py running as its own HTTP process on port 8000.
+    client = FastMCPClient("http://127.0.0.1:8000/mcp")
+    toolset = MCPToolset(client)
+    toolsets = [toolset]
 
+    instructions = (
+        "You are a stock market assistant. You have tools available to fetch "
+        "real, current stock prices and historical data — always use them "
+        "instead of saying you lack access to real-time data. "
+    )
+
+    if settings.alphavantage_api_key and settings.alphavantage_api_key.strip():
+        alphavantage_client = FastMCPClient(
+            f"https://mcp.alphavantage.co/mcp?apikey={settings.alphavantage_api_key.strip()}"
+        )
+        alphavantage_full_toolset = MCPToolset(alphavantage_client)
+        alphavantage_toolset = FilteredToolset(alphavantage_full_toolset, _only_discovery_tools)
+        toolsets.append(alphavantage_toolset)
+        instructions += (
+            "For Alpha Vantage data, use TOOL_LIST or TOOL_GET to discover the right "
+            "tool name, then call it via TOOL_CALL with tool_name and arguments. "
+        )
+
+    instructions += (
+        "If a tool returns an error message (for example, if a symbol is not found or delisted), "
+        "explain the issue politely to the user and suggest checking the ticker symbol."
+    )
 
     return Agent(
         model,
-        instructions=(
-            "You are a stock market assistant. You have tools available to fetch "
-            "real, current stock prices and historical data — always use them "
-            "instead of saying you lack access to real-time data. "
-            "If a tool returns an error message (for example, if a symbol is not found or delisted), "
-            "explain the issue politely to the user and suggest checking the ticker symbol."
-        ),
-        toolsets=[toolset],
+        instructions=instructions,
+        toolsets=toolsets,
     )
 
 

@@ -1,6 +1,6 @@
 # StockBot
 
-Streamlit chatbot using Pydantic AI (Google Gemini), SQLAlchemy, and SQLite. Yahoo Finance calls live in `stock_data.py` so they can later be wrapped by an MCP server; `llm_client.py` can then call that server instead of importing `stock_data` directly.
+Streamlit chatbot using Pydantic AI (Google Gemini), Model Context Protocol (MCP), SQLAlchemy, and SQLite. Stock market data is served via a local MCP server (`mcpserver.py`) with support for optional Alpha Vantage integration.
 
 ## Setup
 
@@ -14,7 +14,7 @@ pip install -r requirements.txt
 
 On macOS/Linux, activate with `source .venv/bin/activate`.
 
-2. Copy the example env file and set your Gemini API key. Do not commit `.env`.
+2. Copy the example env file and set your API keys. Do not commit `.env`.
 
 ```bash
 copy .env.example .env
@@ -26,25 +26,35 @@ On macOS/Linux: `cp .env.example .env`
 LLM_API_KEY=your-google-api-key
 LLM_MODEL=gemini-3.8-flash
 DATABASE_URL=sqlite:///./chatbot.db
+ALPHAVANTAGE_API_KEY=your-alphavantage-api-key  # Optional
 ```
 
-## Run
+## Running the Application
 
+This project runs with a decoupled MCP architecture:
+
+1. **Start the MCP Stock Server** (Terminal 1):
+```bash
+python mcpserver.py
+```
+This runs the MCP server on `http://127.0.0.1:8000/mcp`.
+
+2. **Start the Streamlit Web UI** (Terminal 2):
 ```bash
 streamlit run app.py
 ```
 
-The app creates `chatbot.db` on first launch. Use the sidebar to open past conversations or start a new one. Replies stream in the main pane.
+The app automatically initializes `chatbot.db` on first launch. Use the sidebar to switch conversations or create a new one.
 
 ## Layout
 
 | File | Role |
 | --- | --- |
-| `app.py` | Streamlit UI |
-| `config.py` | Settings from `.env` |
-| `database.py` | Engine, `db_session`, `Base` |
-| `models.py` | Conversation and Message tables |
-| `schemas.py` | Pydantic models shared by UI, DB, and LLM |
-| `repository.py` | Conversation and message persistence |
-| `stock_data.py` | Yahoo Finance (future MCP server) |
-| `llm_client.py` | Pydantic AI agent + streaming (future MCP client) |
+| `mcpserver.py` | Local FastMCP server exposing Yahoo Finance stock tools over streamable HTTP |
+| `llm_client.py` | Pydantic AI agent connected to MCP tools and optional Alpha Vantage discovery |
+| `app.py` | Streamlit UI with streaming chat and conversation sidebar |
+| `config.py` | Environment settings and config loading |
+| `database.py` | SQLAlchemy engine, session management, and SQLite pragmas |
+| `models.py` | SQLAlchemy models for conversations and messages |
+| `repository.py` | CRUD operations for conversations and chat history |
+| `schemas.py` | Pydantic models shared across layers |

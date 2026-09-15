@@ -92,11 +92,12 @@ if prompt:
     except Exception as exc:
         st.error(f"LLM request failed: {exc}")
     else:
-        with db_session() as session:
-            if conversation_id is None:
-                conversation_id = create_conversation(session).id
-                st.session_state.conversation_id = conversation_id
-            add_message(session, conversation_id, Role.user, prompt)
-            # write_stream can return None if the model emitted no text.
-            add_message(session, conversation_id, Role.assistant, reply or "")
-        st.rerun()
+        if reply and str(reply).strip():
+            with db_session() as session:
+                if conversation_id is None:
+                    conversation_id = create_conversation(session).id
+                    st.session_state.conversation_id = conversation_id
+                add_message(session, conversation_id, Role.user, prompt)
+                add_message(session, conversation_id, Role.assistant, str(reply).strip())
+            st.rerun()
+

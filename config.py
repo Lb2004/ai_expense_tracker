@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_model: str = "gemini-3.8-flash"
     database_url: str = "sqlite:///./chatbot.db"
+    alphavantage_api_key: str =''
 
 
 @lru_cache(maxsize=1)
