@@ -1,7 +1,7 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from config import get_settings
@@ -19,7 +19,6 @@ SessionLocal = sessionmaker(
     bind=engine,
     autoflush=False,
     autocommit=False,
-    # Keep loaded attributes usable after commit (we map them to Pydantic next).
     expire_on_commit=False,
 )
 
@@ -34,34 +33,11 @@ def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
     cursor.close()
 
 
-def _ensure_title_column() -> bool:
-    """Add conversations.title on existing DBs. Returns True if the column was just added."""
-    inspector = inspect(engine)
-    if "conversations" not in inspector.get_table_names():
-        return False
-    columns = {column["name"] for column in inspector.get_columns("conversations")}
-    if "title" in columns:
-        return False
-    with engine.begin() as connection:
-        connection.execute(
-            text(
-                "ALTER TABLE conversations "
-                "ADD COLUMN title VARCHAR(64) NOT NULL DEFAULT 'New conversation'"
-            )
-        )
-    return True
-
-
 def init_db() -> None:
     # Import models so their tables are registered on Base before create_all.
-    from models import Conversation, Message  # noqa: F401
+    from models import User, Expense  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
-    if _ensure_title_column():
-        from repository import backfill_conversation_titles
-
-        with db_session() as session:
-            backfill_conversation_titles(session)
 
 
 @contextmanager

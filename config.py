@@ -2,7 +2,6 @@ from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 class Settings(BaseSettings):
     """Runtime config loaded from environment / .env. Never hardcode secrets."""
 
@@ -14,8 +13,7 @@ class Settings(BaseSettings):
 
     llm_api_key: str = ""
     llm_model: str = "gemini-3.8-flash"
-    database_url: str = "sqlite:///./chatbot.db"
-    alphavantage_api_key: str =''
+    database_url: str = "sqlite:///./expenses.db"
 
 
 @lru_cache(maxsize=1)

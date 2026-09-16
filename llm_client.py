@@ -1,27 +1,29 @@
 import os
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
+from datetime import date
 from functools import lru_cache
 
 os.environ.setdefault("PYDANTIC_AI_NO_BANNER", "1")
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, UserPromptPart
 from pydantic_ai.models.google import GoogleModel
 from pydantic_ai.providers.google import GoogleProvider
 from pydantic_ai.mcp import MCPToolset, FastMCPClient
-from pydantic_ai.toolsets import FilteredToolset
 
 from config import Settings, get_settings
 from schemas import ChatMessage, Role
 
-AllowedAlphavantageTools = {"TOOL_LIST", "TOOL_GET", "TOOL_CALL"}
+
+@dataclass
+class Deps:
+    """Dependencies injected into the agent's RunContext."""
+    user_id: int
+    username: str
 
 
-def _only_discovery_tools(ctx, tool_def) -> bool:
-    return tool_def.name in AllowedAlphavantageTools
-
-
-def _build_agent(settings: Settings) -> Agent:
+def _build_agent(settings: Settings) -> Agent[Deps, str]:
     if not settings.llm_api_key or settings.llm_api_key == "your-google-api-key":
         raise ValueError(
             "LLM_API_KEY is not set. Please add your Gemini API key to the .env file."
@@ -32,43 +34,37 @@ def _build_agent(settings: Settings) -> Agent:
         provider=GoogleProvider(api_key=settings.llm_api_key),
     )
 
-    # Connects to mcpserver.py running as its own HTTP process on port 8000.
-    client = FastMCPClient("http://127.0.0.1:8000/mcp")
+    # Connects to expense_mcp_server.py running as its own HTTP process on port 8001.
+    client = FastMCPClient("http://127.0.0.1:8001/mcp")
     toolset = MCPToolset(client)
-    toolsets = [toolset]
 
-    instructions = (
-        "You are a stock market assistant. You have tools available to fetch "
-        "real, current stock prices and historical data — always use them "
-        "instead of saying you lack access to real-time data. "
-    )
-
-    if settings.alphavantage_api_key and settings.alphavantage_api_key.strip():
-        alphavantage_client = FastMCPClient(
-            f"https://mcp.alphavantage.co/mcp?apikey={settings.alphavantage_api_key.strip()}"
+    def dynamic_instructions(ctx: RunContext[Deps]) -> str:
+        today_str = date.today().isoformat()
+        return (
+            f"You are a personal expense tracking assistant for user '{ctx.deps.username}' (user_id={ctx.deps.user_id}).\n\n"
+            f"CURRENT SYSTEM DATE: {today_str} (YYYY-MM-DD).\n\n"
+            f"CRITICAL RULES:\n"
+            f"- The active user's ID is EXACTLY {ctx.deps.user_id}.\n"
+            f"- CURRENCY: All amounts are in Indian Rupees (₹). Always format currency using the ₹ symbol (e.g. ₹50, ₹1,200.00). Never use dollar signs ($).\n"
+            f"- Whenever calling ANY tool (`add_expense`, `list_expenses`, `delete_expense`), you MUST ALWAYS pass user_id={ctx.deps.user_id}. NEVER pass any other user_id.\n"
+            f"- When asked about expenses, spending, or purchases, you MUST call `list_expenses` with user_id={ctx.deps.user_id}.\n"
+            f"- If `list_expenses` returns an empty list, state clearly that user '{ctx.deps.username}' has no recorded expenses yet. NEVER invent, assume, or display fake expenses or demo data.\n"
+            f"- When the user asks to add an expense, extract the amount, category, description, and date from their message.\n"
+            f"  * DATE HANDLING: If the user specifies a date (e.g. 'yesterday' or a specific date), resolve it relative to today ({today_str}). If no date is mentioned, you MUST use today's date ({today_str}). NEVER invent dates from 2024 or 2025.\n"
+            f"- When listing expenses, present them in a readable markdown table format with amounts in ₹.\n"
+            f"- When deleting, confirm which expense was removed."
         )
-        alphavantage_full_toolset = MCPToolset(alphavantage_client)
-        alphavantage_toolset = FilteredToolset(alphavantage_full_toolset, _only_discovery_tools)
-        toolsets.append(alphavantage_toolset)
-        instructions += (
-            "For Alpha Vantage data, use TOOL_LIST or TOOL_GET to discover the right "
-            "tool name, then call it via TOOL_CALL with tool_name and arguments. "
-        )
-
-    instructions += (
-        "If a tool returns an error message (for example, if a symbol is not found or delisted), "
-        "explain the issue politely to the user and suggest checking the ticker symbol."
-    )
 
     return Agent(
         model,
-        instructions=instructions,
-        toolsets=toolsets,
+        instructions=dynamic_instructions,
+        toolsets=[toolset],
+        deps_type=Deps,
     )
 
 
 @lru_cache(maxsize=1)
-def get_agent() -> Agent:
+def get_agent() -> Agent[Deps, str]:
     # Cache so Streamlit does not rebuild the Gemini agent on every rerun.
     return _build_agent(get_settings())
 
@@ -90,12 +86,17 @@ def _to_model_messages(history: Sequence[ChatMessage]) -> list[ModelMessage]:
 def stream_chat_response(
     user_message: str,
     history: Sequence[ChatMessage] = (),
+    *,
+    user_id: int,
+    username: str,
 ) -> Iterator[str]:
     """Yield text deltas from the LLM. Isolated from UI and persistence."""
     agent = get_agent()
     prior = _to_model_messages(history)
+    deps = Deps(user_id=user_id, username=username)
     with agent.run_stream_sync(
         user_message,
+        deps=deps,
         # The API wants None for "no prior turns", not an empty list.
         message_history=prior or None,
     ) as result:

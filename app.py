@@ -1,18 +1,12 @@
 import streamlit as st
+from sqlalchemy import select
 
 from database import db_session, init_db
 from llm_client import stream_chat_response
-from repository import (
-    add_message,
-    create_conversation,
-    delete_conversation,
-    history_as_chat_messages,
-    list_conversations,
-    list_messages,
-)
-from schemas import ConversationOut, Role
+from models import User
+from schemas import ChatMessage, Role
 
-st.set_page_config(page_title="StockBot", page_icon="💬", layout="wide")
+st.set_page_config(page_title="Expense Tracker", page_icon="💰", layout="wide")
 
 
 @st.cache_resource
@@ -22,82 +16,103 @@ def _setup_database() -> None:
 
 _setup_database()
 
-if "conversation_id" not in st.session_state:
-    st.session_state.conversation_id = None
+# ---------------------------------------------------------------------------
+# Session state defaults
+# ---------------------------------------------------------------------------
+if "user_id" not in st.session_state:
+    st.session_state.user_id = None
+if "username" not in st.session_state:
+    st.session_state.username = None
+if "messages" not in st.session_state:
+    st.session_state.messages = []  # list[dict] with "role" and "content"
 
+# ---------------------------------------------------------------------------
+# Login screen — simple username box, creates User row if needed
+# ---------------------------------------------------------------------------
+if st.session_state.user_id is None:
+    st.title("💰 Expense Tracker")
+    st.caption("Log in with a username to start tracking expenses.")
 
-def _active_conversation(conversations: list[ConversationOut]) -> str | None:
-    current_id = st.session_state.conversation_id
-    if current_id and any(item.id == current_id for item in conversations):
-        return current_id
-    if conversations:
-        st.session_state.conversation_id = conversations[0].id
-        return conversations[0].id
-    st.session_state.conversation_id = None
-    return None
-
-
-with db_session() as session:
-    conversations = list_conversations(session)
-    conversation_id = _active_conversation(conversations)
-    messages = list_messages(session, conversation_id) if conversation_id else []
-
-with st.sidebar:
-    st.header("Conversations")
-    if st.button("New conversation", key="new_conversation", use_container_width=True):
-        # Reuse the open chat when it is still empty so we do not stack blanks.
-        if not (conversation_id and not messages):
+    with st.form("login_form"):
+        username = st.text_input("Username", placeholder="e.g. alice")
+        submitted = st.form_submit_button("Log in", type="primary")
+        if submitted and username and username.strip():
+            username = username.strip().lower()
             with db_session() as session:
-                created = create_conversation(session)
-                st.session_state.conversation_id = created.id
+                stmt = select(User).where(User.username == username)
+                user = session.scalars(stmt).first()
+                if user is None:
+                    user = User(username=username)
+                    session.add(user)
+                    session.flush()
+                st.session_state.user_id = user.id
+                st.session_state.username = user.username
+                st.session_state.messages = []
+            st.rerun()
+    st.stop()
+
+# ---------------------------------------------------------------------------
+# Main chat interface (user is logged in)
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    st.header(f"👤 {st.session_state.username}")
+    st.caption(f"User ID: `{st.session_state.user_id}`")
+
+    # Show count of user's expenses directly from DB
+    with db_session() as session:
+        from models import Expense
+        count = len(session.scalars(select(Expense).where(Expense.user_id == st.session_state.user_id)).all())
+    st.metric("Logged Expenses", count)
+
+    if st.button("Log out", use_container_width=True):
+        st.session_state.user_id = None
+        st.session_state.username = None
+        st.session_state.messages = []
         st.rerun()
 
-    for item in conversations:
-        selected = item.id == conversation_id
-        open_col, delete_col = st.columns([4, 1])
-        with open_col:
-            if st.button(
-                item.title,
-                key=f"conv-{item.id}",
-                use_container_width=True,
-                type="primary" if selected else "secondary",
-            ):
-                st.session_state.conversation_id = item.id
-                st.rerun()
-        with delete_col:
-            if st.button("✕", key=f"del-{item.id}", use_container_width=True, help="Delete conversation"):
-                with db_session() as session:
-                    delete_conversation(session, item.id)
-                if st.session_state.conversation_id == item.id:
-                    st.session_state.conversation_id = None
-                st.rerun()
+    st.divider()
+    st.caption(
+        "Try: *\"Add a ₹150 lunch expense today\"* or *\"List my expenses\"* "
+        "or *\"Delete expense #3\"*"
+    )
 
-st.title("StockBot")
-st.caption("A chatbot that can answer questions about stocks and the stock market.")
+st.title("💰 Expense Tracker")
+st.caption(f"Logged in as **{st.session_state.username}** — chat to manage your expenses.")
 
-for message in messages:
-    with st.chat_message(message.role.value):
-        st.markdown(message.content)
+# Render existing messages
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
 
+# Chat input
 prompt = st.chat_input("Send a message")
 if prompt:
-    prior = history_as_chat_messages(messages)
-
+    # Show user message immediately
+    st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
+    # Build history for the LLM
+    history = [
+        ChatMessage(role=Role(m["role"]), content=m["content"])
+        for m in st.session_state.messages[:-1]  # exclude current prompt
+    ]
+
     try:
         with st.chat_message("assistant"):
-            reply = st.write_stream(stream_chat_response(prompt, prior))
+            reply = st.write_stream(
+                stream_chat_response(
+                    prompt,
+                    history,
+                    user_id=st.session_state.user_id,
+                    username=st.session_state.username,
+                )
+            )
     except Exception as exc:
         st.error(f"LLM request failed: {exc}")
     else:
         if reply and str(reply).strip():
-            with db_session() as session:
-                if conversation_id is None:
-                    conversation_id = create_conversation(session).id
-                    st.session_state.conversation_id = conversation_id
-                add_message(session, conversation_id, Role.user, prompt)
-                add_message(session, conversation_id, Role.assistant, str(reply).strip())
+            st.session_state.messages.append(
+                {"role": "assistant", "content": str(reply).strip()}
+            )
             st.rerun()
-
