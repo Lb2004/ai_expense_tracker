@@ -1,9 +1,15 @@
 """
 Expense Tracker MCP Server — standalone HTTP process on port 8001.
 
-Self-contained: defines its own models and DB access so it can run
-independently of the Streamlit app.  All mutating/querying tools use
-session_token for auth — no raw user_id accepted from callers.
+Self-contained: imports shared model definitions and sets up its own
+DB engine so it can run independently of the Streamlit app.  All
+mutating/querying tools use session_token for auth — no raw user_id
+accepted from callers.
+
+Known limitation (#18): The server binds to 127.0.0.1 by default
+(see MCPServer.run_streamable_http_async), which is intentional for
+this POC — it should NOT be exposed on 0.0.0.0 without adding
+proper transport-level authentication.
 
 Run:  python expense_mcp_server.py
 Test: open MCP Inspector at http://127.0.0.1:8001/mcp
@@ -11,37 +17,20 @@ Test: open MCP Inspector at http://127.0.0.1:8001/mcp
 
 import asyncio
 import re
-import uuid
+import secrets
 from datetime import date, datetime, timedelta, timezone
 
 import sqlparse
+import bcrypt as _bcrypt_lib
 from pydantic import BaseModel
-from sqlalchemy import (
-    Date,
-    DateTime,
-    Float,
-    ForeignKey,
-    Integer,
-    String,
-    Text,
-    create_engine,
-    event,
-    select,
-    text,
-)
-from sqlalchemy.orm import (
-    DeclarativeBase,
-    Mapped,
-    Session,
-    mapped_column,
-    relationship,
-    sessionmaker,
-)
+from sqlalchemy import create_engine, event, select, text
+from sqlalchemy.orm import Session, sessionmaker
 
 from mcp.server.mcpserver import MCPServer
+from shared_models import Base, Budget, Expense, User, UserSession, _utcnow
 
 # ---------------------------------------------------------------------------
-# Database setup (self-contained — mirrors the app's database.py)
+# Database setup (self-contained — its own engine, separate from app's)
 # ---------------------------------------------------------------------------
 
 DATABASE_URL = "sqlite:///./expenses.db"
@@ -61,99 +50,39 @@ def _enable_fk(dbapi_conn, _rec):
     cursor.close()
 
 
-class Base(DeclarativeBase):
-    pass
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-# ---------------------------------------------------------------------------
-# SQLAlchemy models (duplicated so the server is independently runnable)
-# ---------------------------------------------------------------------------
-
-
-class User(Base):
-    __tablename__ = "users"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow, nullable=False
-    )
-    expenses: Mapped[list["Expense"]] = relationship(
-        back_populates="user", cascade="all, delete-orphan"
-    )
-
-
-class Expense(Base):
-    __tablename__ = "expenses"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(
-        Integer,
-        ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    amount: Mapped[float] = mapped_column(Float, nullable=False)
-    category: Mapped[str] = mapped_column(String(64), nullable=False)
-    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    date: Mapped[date] = mapped_column(Date, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow, nullable=False
-    )
-    user: Mapped[User] = relationship(back_populates="expenses")
-
-
-class UserSession(Base):
-    """Server-validated session tokens — never trust caller-provided user_id."""
-
-    __tablename__ = "sessions"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    token: Mapped[str] = mapped_column(
-        String(36), unique=True, nullable=False, index=True
-    )
-    user_id: Mapped[int] = mapped_column(
-        Integer,
-        ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow, nullable=False
-    )
-    expires_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
-
-
-class Budget(Base):
-    """Per-user monthly budget — one row per user."""
-
-    __tablename__ = "budgets"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(
-        Integer,
-        ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
-        unique=True,
-    )
-    monthly_limit: Mapped[float] = mapped_column(Float, nullable=False, default=50000.0)
-
-
 # Create tables on import (idempotent).
 Base.metadata.create_all(bind=engine)
 
 
 # ---------------------------------------------------------------------------
-# Session helpers
+# Password helpers (bcrypt) — Fix #2
 # ---------------------------------------------------------------------------
 
-DEFAULT_BUDGET = 50000.0
+
+def hash_password(plain: str) -> str:
+    """Hash a plaintext password with bcrypt.  Never stores or logs plain."""
+    return _bcrypt_lib.hashpw(plain.encode("utf-8"), _bcrypt_lib.gensalt()).decode("ascii")
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    """Verify a plaintext password against a bcrypt hash."""
+    return _bcrypt_lib.checkpw(plain.encode("utf-8"), hashed.encode("ascii"))
+
+
+# ---------------------------------------------------------------------------
+# Session helpers
+# ---------------------------------------------------------------------------
+# Fix #9: removed unused DEFAULT_BUDGET = 50000.0 constant.  The Budget
+# model's own column default (50000.0) is the canonical source.
 
 
 def create_session(user_id: int) -> str:
-    """Create a new session token for a user. Returns the token string."""
-    token = str(uuid.uuid4())
+    """Create a new session token for a user.  Returns the token string.
+
+    Fix #2: uses secrets.token_urlsafe(32) for cryptographically secure
+    token generation instead of uuid.uuid4().
+    """
+    token = secrets.token_urlsafe(32)
     now = _utcnow()
     with SessionLocal() as session:
         sess = UserSession(
@@ -170,15 +99,65 @@ def create_session(user_id: int) -> str:
 def resolve_session(token: str) -> int:
     """Validate a session token and return the associated user_id.
     Raises ValueError if the token is invalid or expired.
+
+    Fix #2: expires_at is actively checked — an expired token is rejected
+    even if it exists in the DB.
     """
     with SessionLocal() as session:
         stmt = select(UserSession).where(UserSession.token == token)
         sess = session.scalars(stmt).first()
         if sess is None:
-            raise ValueError(f"Invalid session token.")
+            raise ValueError("Invalid session token.")
+        # Explicit expiry enforcement — this MUST remain; see regression
+        # test test_expired_session_rejected_by_tool.
         if sess.expires_at.replace(tzinfo=timezone.utc) < _utcnow():
-            raise ValueError(f"Session token has expired.")
+            raise ValueError("Session token has expired.")
         return sess.user_id
+
+
+# ---------------------------------------------------------------------------
+# User signup / login (internal, NOT MCP-exposed) — Fix #1, #2
+# ---------------------------------------------------------------------------
+# These functions are called ONLY from app.py's login flow, never via MCP.
+# Fix #1: create_user_session was previously decorated with @mcp.tool(),
+# making it callable by the agent with an arbitrary user_id and no password.
+# It is now a plain internal function and must NEVER appear in tools/list.
+
+
+def signup_user(username: str, password: str) -> tuple[int, str]:
+    """Register a new user with bcrypt-hashed password.  Returns (user_id, token).
+    Raises ValueError if username already taken.
+    """
+    pw_hash = hash_password(password)
+    with SessionLocal() as session:
+        existing = session.scalars(
+            select(User).where(User.username == username)
+        ).first()
+        if existing is not None:
+            raise ValueError(f"Username '{username}' is already taken.")
+        user = User(username=username, password_hash=pw_hash)
+        session.add(user)
+        session.commit()
+        user_id = user.id
+    token = create_session(user_id)
+    return user_id, token
+
+
+def login_user(username: str, password: str) -> tuple[int, str]:
+    """Authenticate a user and return (user_id, token).
+    Raises ValueError if credentials are wrong.
+    """
+    with SessionLocal() as session:
+        user = session.scalars(
+            select(User).where(User.username == username)
+        ).first()
+        if user is None:
+            raise ValueError("Invalid username or password.")
+        if not verify_password(password, user.password_hash):
+            raise ValueError("Invalid username or password.")
+        user_id = user.id
+    token = create_session(user_id)
+    return user_id, token
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +194,10 @@ _DANGEROUS_KW = {
 def validate_sql(raw_sql: str) -> str:
     """Validate and sanitize a SQL query for safety.
     Returns the cleaned SQL or raises ValueError.
+
+    Fix #3: queries now run against the temp VIEW 'my_expenses', not the
+    raw 'expenses' table.  This function validates that the query only
+    references 'my_expenses' and uses allowed columns.
     """
     # Parse with sqlparse
     parsed = sqlparse.parse(raw_sql.strip())
@@ -230,7 +213,6 @@ def validate_sql(raw_sql: str) -> str:
 
     # Check for dangerous keywords
     for kw in _DANGEROUS_KW:
-        # Use word-boundary matching to avoid false positives (e.g. "description" containing "create"... no but "delete" in "deleted")
         if re.search(rf"\b{kw}\b", sql_lower):
             raise ValueError(f"Forbidden keyword: {kw}")
 
@@ -238,8 +220,12 @@ def validate_sql(raw_sql: str) -> str:
     if ";" in raw_sql:
         raise ValueError("Multiple statements are not allowed.")
 
+    # Strip quoted string literals before identifier extraction so that
+    # string values like 'food' don't get flagged as unknown identifiers.
+    stripped_sql = re.sub(r"'[^']*'", "", sql_lower)
+
     # Extract all identifiers and check against allowlist
-    identifiers = set(_IDENT_RE.findall(sql_lower))
+    identifiers = set(_IDENT_RE.findall(stripped_sql))
     # Remove SQL keywords, aggregates, and known safe tokens
     sql_keywords = {
         "select", "from", "where", "and", "or", "not", "in", "between",
@@ -247,12 +233,16 @@ def validate_sql(raw_sql: str) -> str:
         "limit", "offset", "asc", "desc", "distinct", "case", "when", "then",
         "else", "end", "cast", "coalesce", "ifnull", "strftime", "substr",
         "length", "lower", "upper", "trim", "round", "abs", "total",
-        "expenses", "true", "false",
+        "my_expenses", "true", "false",
     }
     safe_tokens = ALLOWED_COLUMNS | ALLOWED_AGGREGATES | sql_keywords
     unsafe = identifiers - safe_tokens
-    # Filter out numeric-looking tokens and parameter placeholders
-    unsafe = {t for t in unsafe if not t.isdigit() and t != "uid"}
+    # Filter out numeric-looking tokens, parameter placeholders, and
+    # single-letter identifiers (common table aliases like e, t, x).
+    unsafe = {
+        t for t in unsafe
+        if not t.isdigit() and t != "uid" and len(t) > 1
+    }
     if unsafe:
         raise ValueError(
             f"Disallowed column(s) or identifier(s): {', '.join(sorted(unsafe))}. "
@@ -281,31 +271,9 @@ class ExpenseOut(BaseModel):
 
 mcp = MCPServer("expense-server")
 
-
-@mcp.tool()
-async def create_user_session(user_id: int) -> str:
-    """Create a session token for a user at login time.
-
-    This is called by the app at login — NOT by the LLM during conversation.
-
-    Args:
-        user_id: The ID of the user logging in.
-
-    Returns:
-        A session token string (UUID) valid for 24 hours.
-    """
-    def _create() -> str:
-        with SessionLocal() as session:
-            user = session.get(User, user_id)
-            if user is None:
-                raise ValueError(f"No user with id {user_id}")
-        return create_session(user_id)
-
-    try:
-        token = await asyncio.to_thread(_create)
-    except ValueError as exc:
-        return f"Error: {exc}"
-    return token
+# NOTE: create_user_session / signup_user / login_user are NOT registered
+# as MCP tools.  They are internal functions called only from app.py.
+# Fix #1: This is intentional — these must NEVER appear in tools/list.
 
 
 @mcp.tool()
@@ -334,6 +302,10 @@ async def add_expense(
     except ValueError as exc:
         return f"Error: {exc}"
 
+    # Fix #10: Reject non-positive amounts.
+    if amount <= 0:
+        return f"Error: Amount must be positive, got {amount}."
+
     # Validate date
     clean_date = (date or "").strip()
     if not clean_date or clean_date.lower() == "today":
@@ -344,9 +316,6 @@ async def add_expense(
             parsed_date = datetime.strptime(clean_date, "%Y-%m-%d").date()
         except ValueError:
             return f"Error: Invalid date format '{date}'. Use YYYY-MM-DD."
-
-    if amount <= 0:
-        return f"Error: Amount must be positive, got {amount}."
 
     def _insert() -> int:
         with SessionLocal() as session:
@@ -396,11 +365,12 @@ async def delete_expense(session_token: str, expense_id: int) -> str:
 
 
 @mcp.tool()
-async def list_expenses(session_token: str) -> list[dict]:
-    """List all expenses for the authenticated user.
+async def list_expenses(session_token: str, limit: int = 50) -> list[dict]:
+    """List expenses for the authenticated user.
 
     Args:
         session_token: The session token of the authenticated user.
+        limit: Maximum number of expenses to return (default 50, max 200).
 
     Returns:
         A list of expense dicts, or an error string.
@@ -410,12 +380,16 @@ async def list_expenses(session_token: str) -> list[dict]:
     except ValueError as exc:
         return [{"error": str(exc)}]
 
+    # Fix #8: cap at 200 to prevent unbounded result sets.
+    effective_limit = min(max(limit, 1), 200)
+
     def _query() -> list[dict]:
         with SessionLocal() as session:
             stmt = (
                 select(Expense)
                 .where(Expense.user_id == user_id)
                 .order_by(Expense.date.desc())
+                .limit(effective_limit)
             )
             rows = session.scalars(stmt).all()
             return [
@@ -443,7 +417,7 @@ async def get_expense_schema() -> dict:
         A dict describing the queryable schema.
     """
     return {
-        "table": "expenses",
+        "table": "my_expenses",
         "columns": {
             "id": "integer — unique expense ID",
             "amount": "float — expense amount in ₹",
@@ -453,8 +427,10 @@ async def get_expense_schema() -> dict:
         },
         "allowed_aggregates": sorted(ALLOWED_AGGREGATES),
         "notes": (
-            "All queries are automatically scoped to the authenticated user. "
-            "Do NOT include user_id in your SQL. Only SELECT statements are allowed."
+            "All queries are automatically scoped to the authenticated user "
+            "via a temporary VIEW named 'my_expenses'. Write your SQL "
+            "against 'my_expenses', NOT 'expenses'. Only SELECT statements "
+            "are allowed. Do NOT include user_id in your SQL."
         ),
     }
 
@@ -464,13 +440,15 @@ async def query_expenses(session_token: str, sql_query: str) -> list[dict] | str
     """Run a safe, read-only SQL query against the authenticated user's expenses.
 
     The query is validated for safety (SELECT-only, column allowlist enforced).
-    A WHERE clause scoping results to the authenticated user is automatically injected.
+    A temporary VIEW 'my_expenses' scoped to the authenticated user is created
+    automatically — your query should reference 'my_expenses', not 'expenses'.
 
     Args:
         session_token: The session token of the authenticated user.
-        sql_query: A SELECT query using only allowed columns (amount, category, description, date, id).
-                   Do NOT include user_id filters — they are auto-injected.
-                   Example: "SELECT category, SUM(amount) FROM expenses GROUP BY category"
+        sql_query: A SELECT query using only allowed columns (amount, category, description, date, id)
+                   against the 'my_expenses' table.
+                   Do NOT include user_id filters — they are auto-injected via the VIEW.
+                   Example: "SELECT category, SUM(amount) FROM my_expenses GROUP BY category"
 
     Returns:
         Query results as a list of dicts, or an error string.
@@ -485,46 +463,38 @@ async def query_expenses(session_token: str, sql_query: str) -> list[dict] | str
     except ValueError as exc:
         return f"SQL validation error: {exc}"
 
-    # Auto-inject user_id filter
-    # Strategy: wrap the user's query and add WHERE user_id = :uid
-    # We inject into the original query by finding FROM expenses and adding WHERE
-    safe_sql = _inject_user_filter(validated_sql, user_id)
+    # Fix #3: Use a per-request temporary VIEW instead of regex-based
+    # _inject_user_filter.  The temp VIEW exposes only allowlisted columns
+    # and is scoped to the authenticated user via a parameterized WHERE.
+    # This approach is immune to table-alias problems (e.g. "FROM expenses e")
+    # that broke the old regex injection.
 
     def _execute() -> list[dict]:
         with SessionLocal() as session:
-            result = session.execute(
-                text(safe_sql),
-                {"uid": user_id},
+            # Create temp VIEW scoped to this user.
+            # NOTE: SQLite does not allow bound parameters in CREATE VIEW
+            # statements.  This is safe because user_id is an int returned
+            # by resolve_session() (server-controlled), not user input.
+            session.execute(
+                text(
+                    f"CREATE TEMP VIEW IF NOT EXISTS my_expenses AS "
+                    f"SELECT id, amount, category, description, date "
+                    f"FROM expenses WHERE user_id = {int(user_id)}"
+                )
             )
-            columns = list(result.keys())
-            rows = result.fetchmany(200)  # cap at 200 rows
-            return [dict(zip(columns, row)) for row in rows]
+            try:
+                result = session.execute(text(validated_sql))
+                columns = list(result.keys())
+                rows = result.fetchmany(200)  # cap at 200 rows
+                return [dict(zip(columns, row)) for row in rows]
+            finally:
+                # Clean up the temp view
+                session.execute(text("DROP VIEW IF EXISTS my_expenses"))
 
     try:
         return await asyncio.to_thread(_execute)
     except Exception as exc:
         return f"Query execution error: {exc}"
-
-
-def _inject_user_filter(sql: str, user_id: int) -> str:
-    """Inject WHERE user_id = :uid into a SELECT ... FROM expenses query."""
-    # Case-insensitive replacement
-    # Find "FROM expenses" and inject "WHERE user_id = :uid" after it
-    pattern = re.compile(r"(FROM\s+expenses)", re.IGNORECASE)
-    match = pattern.search(sql)
-    if not match:
-        raise ValueError("Query must reference the 'expenses' table.")
-
-    insert_pos = match.end()
-    rest = sql[insert_pos:].strip()
-
-    if rest.upper().startswith("WHERE"):
-        # Already has a WHERE — add AND
-        injected = sql[:insert_pos] + " WHERE user_id = :uid AND " + rest[5:].strip()
-    else:
-        injected = sql[:insert_pos] + " WHERE user_id = :uid " + rest
-
-    return injected
 
 
 @mcp.tool()
@@ -640,5 +610,95 @@ async def can_i_afford(session_token: str, item_description: str, item_cost: flo
     return await asyncio.to_thread(_analyze)
 
 
+# ---------------------------------------------------------------------------
+# MCP Resource — monthly summary (#21)
+# ---------------------------------------------------------------------------
+
+@mcp.resource(
+    "expense://summary/{session_token}/monthly",
+    name="monthly_summary",
+    title="Monthly Expense Summary",
+    description=(
+        "Returns a JSON summary of the authenticated user's monthly spending: "
+        "total spent, top category, comparison to last month, and remaining budget."
+    ),
+    mime_type="application/json",
+)
+async def monthly_summary_resource(session_token: str) -> dict:
+    """MCP Resource: monthly spending summary for the authenticated user."""
+    try:
+        user_id = resolve_session(session_token)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    import json
+
+    def _build_summary() -> dict:
+        with SessionLocal() as session:
+            today = datetime.now(timezone.utc).date()
+            first_of_month = today.replace(day=1)
+
+            # This month's expenses
+            this_month = session.scalars(
+                select(Expense).where(
+                    Expense.user_id == user_id,
+                    Expense.date >= first_of_month,
+                    Expense.date <= today,
+                )
+            ).all()
+
+            total_spent = sum(e.amount for e in this_month)
+
+            # Top category
+            cat_totals: dict[str, float] = {}
+            for e in this_month:
+                cat_totals[e.category] = cat_totals.get(e.category, 0) + e.amount
+            top_category = max(cat_totals, key=cat_totals.get) if cat_totals else "none"
+            top_category_amount = cat_totals.get(top_category, 0)
+
+            # Last month comparison
+            if first_of_month.month == 1:
+                last_month_start = first_of_month.replace(year=first_of_month.year - 1, month=12)
+            else:
+                last_month_start = first_of_month.replace(month=first_of_month.month - 1)
+            last_month_end = first_of_month - timedelta(days=1)
+
+            last_month_expenses = session.scalars(
+                select(Expense).where(
+                    Expense.user_id == user_id,
+                    Expense.date >= last_month_start,
+                    Expense.date <= last_month_end,
+                )
+            ).all()
+            last_month_total = sum(e.amount for e in last_month_expenses)
+
+            if last_month_total > 0:
+                pct_change = ((total_spent - last_month_total) / last_month_total) * 100
+            else:
+                pct_change = 100.0 if total_spent > 0 else 0.0
+
+            # Budget
+            budget_row = session.scalars(
+                select(Budget).where(Budget.user_id == user_id)
+            ).first()
+            remaining_budget = (budget_row.monthly_limit - total_spent) if budget_row else None
+            monthly_limit = budget_row.monthly_limit if budget_row else None
+
+            return {
+                "month": first_of_month.isoformat(),
+                "total_spent": round(total_spent, 2),
+                "top_category": top_category,
+                "top_category_amount": round(top_category_amount, 2),
+                "last_month_total": round(last_month_total, 2),
+                "pct_change_vs_last_month": round(pct_change, 1),
+                "monthly_budget": monthly_limit,
+                "remaining_budget": round(remaining_budget, 2) if remaining_budget is not None else None,
+                "expense_count": len(this_month),
+            }
+
+    return await asyncio.to_thread(_build_summary)
+
+
 if __name__ == "__main__":
+    # Binds to 127.0.0.1:8001 (localhost only, intentional for POC — see #18)
     mcp.run(transport="streamable-http", port=8001)

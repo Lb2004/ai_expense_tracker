@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     llm_model: str = "gemini-3.8-flash"
     database_url: str = "sqlite:///./expenses.db"
 
+    # Fix #6: MCP server URLs are now configurable rather than hardcoded.
+    mcp_server_url: str = "http://127.0.0.1:8001/mcp"
+    financial_insights_url: str = "http://127.0.0.1:8002/mcp"
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

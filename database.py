@@ -2,13 +2,16 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 from sqlalchemy import create_engine, event
-from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from config import get_settings
 
-
-class Base(DeclarativeBase):
-    pass
+# shared_models.py is dependency-free, so this import is safe at the
+# top level — no circular-import workaround needed.  (Fix #17: the old
+# local import inside init_db() was required because models.py used to
+# import Base from database.py, creating a cycle.  shared_models.py
+# defines its own Base, breaking the cycle.)
+from shared_models import Base, Budget, Expense, User, UserSession  # noqa: F401
 
 
 _url = get_settings().database_url
@@ -34,9 +37,8 @@ def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
 
 
 def init_db() -> None:
-    # Import models so their tables are registered on Base before create_all.
-    from models import User, Expense, UserSession, Budget  # noqa: F401
-
+    # All models are imported at the top level from shared_models, so
+    # their tables are already registered on Base by the time we get here.
     Base.metadata.create_all(bind=engine)
 
 
