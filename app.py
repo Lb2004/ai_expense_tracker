@@ -17,12 +17,28 @@ def _setup_database() -> None:
 _setup_database()
 
 # ---------------------------------------------------------------------------
+# Helper — create session token via MCP server
+# ---------------------------------------------------------------------------
+
+def _create_session_token(user_id: int) -> str:
+    """Call the MCP server's create_user_session tool directly.
+    Since the MCP server uses the same DB, we can call the helper directly.
+    """
+    # Import from the MCP server to create a session token.
+    # This is a direct function call, not an MCP tool invocation.
+    from expense_mcp_server import create_session
+    return create_session(user_id)
+
+
+# ---------------------------------------------------------------------------
 # Session state defaults
 # ---------------------------------------------------------------------------
 if "user_id" not in st.session_state:
     st.session_state.user_id = None
 if "username" not in st.session_state:
     st.session_state.username = None
+if "session_token" not in st.session_state:
+    st.session_state.session_token = None
 if "messages" not in st.session_state:
     st.session_state.messages = []  # list[dict] with "role" and "content"
 
@@ -48,6 +64,11 @@ if st.session_state.user_id is None:
                 st.session_state.user_id = user.id
                 st.session_state.username = user.username
                 st.session_state.messages = []
+
+            # Create a session token for the MCP server
+            st.session_state.session_token = _create_session_token(
+                st.session_state.user_id
+            )
             st.rerun()
     st.stop()
 
@@ -67,13 +88,14 @@ with st.sidebar:
     if st.button("Log out", use_container_width=True):
         st.session_state.user_id = None
         st.session_state.username = None
+        st.session_state.session_token = None
         st.session_state.messages = []
         st.rerun()
 
     st.divider()
     st.caption(
-        "Try: *\"Add a ₹150 lunch expense today\"* or *\"List my expenses\"* "
-        "or *\"Delete expense #3\"*"
+        "Try: *\\\"Add a ₹150 lunch expense today\\\"* or *\\\"List my expenses\\\"* "
+        "or *\\\"Can I afford a ₹15,000 phone?\\\"*"
     )
 
 st.title("💰 Expense Tracker")
@@ -104,7 +126,7 @@ if prompt:
                 stream_chat_response(
                     prompt,
                     history,
-                    user_id=st.session_state.user_id,
+                    session_token=st.session_state.session_token,
                     username=st.session_state.username,
                 )
             )

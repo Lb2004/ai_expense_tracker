@@ -35,7 +35,7 @@ def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
 
 def init_db() -> None:
     # Import models so their tables are registered on Base before create_all.
-    from models import User, Expense  # noqa: F401
+    from models import User, Expense, UserSession, Budget  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
 

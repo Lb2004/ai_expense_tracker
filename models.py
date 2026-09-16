@@ -40,3 +40,35 @@ class Expense(Base):
     )
 
     user: Mapped[User] = relationship(back_populates="expenses")
+
+
+class UserSession(Base):
+    """Server-validated session tokens."""
+
+    __tablename__ = "sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    token: Mapped[str] = mapped_column(
+        String(36), unique=True, nullable=False, index=True
+    )
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class Budget(Base):
+    """Per-user monthly budget."""
+
+    __tablename__ = "budgets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    monthly_limit: Mapped[float] = mapped_column(Float, nullable=False, default=50000.0)

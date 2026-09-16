@@ -19,7 +19,7 @@ from schemas import ChatMessage, Role
 @dataclass
 class Deps:
     """Dependencies injected into the agent's RunContext."""
-    user_id: int
+    session_token: str
     username: str
 
 
@@ -41,17 +41,29 @@ def _build_agent(settings: Settings) -> Agent[Deps, str]:
     def dynamic_instructions(ctx: RunContext[Deps]) -> str:
         today_str = date.today().isoformat()
         return (
-            f"You are a personal expense tracking assistant for user '{ctx.deps.username}' (user_id={ctx.deps.user_id}).\n\n"
+            f"You are a personal expense tracking assistant for user '{ctx.deps.username}'.\n\n"
             f"CURRENT SYSTEM DATE: {today_str} (YYYY-MM-DD).\n\n"
+            f"SESSION TOKEN: {ctx.deps.session_token}\n\n"
             f"CRITICAL RULES:\n"
-            f"- The active user's ID is EXACTLY {ctx.deps.user_id}.\n"
+            f"- AUTHENTICATION: Your session token is '{ctx.deps.session_token}'. You MUST pass this as the `session_token` argument to EVERY tool call. NEVER invent, modify, or omit the token.\n"
             f"- CURRENCY: All amounts are in Indian Rupees (₹). Always format currency using the ₹ symbol (e.g. ₹50, ₹1,200.00). Never use dollar signs ($).\n"
-            f"- Whenever calling ANY tool (`add_expense`, `list_expenses`, `delete_expense`), you MUST ALWAYS pass user_id={ctx.deps.user_id}. NEVER pass any other user_id.\n"
-            f"- When asked about expenses, spending, or purchases, you MUST call `list_expenses` with user_id={ctx.deps.user_id}.\n"
-            f"- If `list_expenses` returns an empty list, state clearly that user '{ctx.deps.username}' has no recorded expenses yet. NEVER invent, assume, or display fake expenses or demo data.\n"
-            f"- When the user asks to add an expense, extract the amount, category, description, and date from their message.\n"
-            f"  * DATE HANDLING: If the user specifies a date (e.g. 'yesterday' or a specific date), resolve it relative to today ({today_str}). If no date is mentioned, you MUST use today's date ({today_str}). NEVER invent dates from 2024 or 2025.\n"
+            f"- NEVER call `create_user_session` — that tool is for the login system only.\n\n"
+            f"AVAILABLE TOOLS & WHEN TO USE THEM:\n"
+            f"- `add_expense`: When the user wants to add/record a new expense.\n"
+            f"- `list_expenses`: When the user asks to see, list, or view their expenses.\n"
+            f"- `delete_expense`: When the user wants to remove an expense by ID.\n"
+            f"- `set_budget`: When the user wants to set or change their monthly budget.\n"
+            f"- `can_i_afford`: When the user asks 'can I afford X?' or similar affordability questions. Extract item_description and item_cost from the message. IMPORTANT: If the tool returns an error with 'no_budget_set', ask the user to set their monthly budget first (e.g. 'What is your monthly budget? You can say something like: Set my budget to ₹30,000').\n"
+            f"- `get_expense_schema`: Call this BEFORE `query_expenses` to learn the available columns.\n"
+            f"- `query_expenses`: For analytical questions like 'total spending on food', 'average expense last month', etc. Write a SELECT query using ONLY the columns from get_expense_schema. Do NOT include user_id in your SQL — it is auto-injected.\n\n"
+            f"DATE HANDLING:\n"
+            f"- If the user specifies a date, resolve it relative to today ({today_str}).\n"
+            f"- If no date is mentioned for add_expense, use today's date ({today_str}).\n"
+            f"- NEVER invent dates from 2024 or 2025.\n\n"
+            f"DISPLAY RULES:\n"
             f"- When listing expenses, present them in a readable markdown table format with amounts in ₹.\n"
+            f"- If list_expenses returns empty, state clearly the user has no recorded expenses. NEVER invent fake data.\n"
+            f"- When showing can_i_afford results, present the analysis conversationally using the structured data.\n"
             f"- When deleting, confirm which expense was removed."
         )
 
@@ -87,13 +99,13 @@ def stream_chat_response(
     user_message: str,
     history: Sequence[ChatMessage] = (),
     *,
-    user_id: int,
+    session_token: str,
     username: str,
 ) -> Iterator[str]:
     """Yield text deltas from the LLM. Isolated from UI and persistence."""
     agent = get_agent()
     prior = _to_model_messages(history)
-    deps = Deps(user_id=user_id, username=username)
+    deps = Deps(session_token=session_token, username=username)
     with agent.run_stream_sync(
         user_message,
         deps=deps,
