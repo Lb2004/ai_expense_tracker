@@ -6,7 +6,7 @@ DB engine so it can run independently of the Streamlit app.  All
 mutating/querying tools use session_token for auth — no raw user_id
 accepted from callers.
 
-Known limitation (#18): The server binds to 127.0.0.1 by default
+Known limitation: The server binds to 127.0.0.1 by default
 (see MCPServer.run_streamable_http_async), which is intentional for
 this POC — it should NOT be exposed on 0.0.0.0 without adding
 proper transport-level authentication.
@@ -55,7 +55,7 @@ Base.metadata.create_all(bind=engine)
 
 
 # ---------------------------------------------------------------------------
-# Password helpers (bcrypt) — Fix #2
+# Password helpers (bcrypt)
 # ---------------------------------------------------------------------------
 
 
@@ -72,14 +72,12 @@ def verify_password(plain: str, hashed: str) -> bool:
 # ---------------------------------------------------------------------------
 # Session helpers
 # ---------------------------------------------------------------------------
-# Fix #9: removed unused DEFAULT_BUDGET = 50000.0 constant.  The Budget
-# model's own column default (50000.0) is the canonical source.
 
 
 def create_session(user_id: int) -> str:
     """Create a new session token for a user.  Returns the token string.
 
-    Fix #2: uses secrets.token_urlsafe(32) for cryptographically secure
+    uses secrets.token_urlsafe(32) for cryptographically secure
     token generation instead of uuid.uuid4().
     """
     token = secrets.token_urlsafe(32)
@@ -100,7 +98,7 @@ def resolve_session(token: str) -> int:
     """Validate a session token and return the associated user_id.
     Raises ValueError if the token is invalid or expired.
 
-    Fix #2: expires_at is actively checked — an expired token is rejected
+    expires_at is actively checked — an expired token is rejected
     even if it exists in the DB.
     """
     with SessionLocal() as session:
@@ -475,9 +473,11 @@ async def query_expenses(session_token: str, sql_query: str) -> list[dict] | str
             # NOTE: SQLite does not allow bound parameters in CREATE VIEW
             # statements.  This is safe because user_id is an int returned
             # by resolve_session() (server-controlled), not user input.
+            # Always drop any stale temp view on this connection before creating
+            session.execute(text("DROP VIEW IF EXISTS my_expenses"))
             session.execute(
                 text(
-                    f"CREATE TEMP VIEW IF NOT EXISTS my_expenses AS "
+                    f"CREATE TEMP VIEW my_expenses AS "
                     f"SELECT id, amount, category, description, date "
                     f"FROM expenses WHERE user_id = {int(user_id)}"
                 )
@@ -611,7 +611,7 @@ async def can_i_afford(session_token: str, item_description: str, item_cost: flo
 
 
 # ---------------------------------------------------------------------------
-# MCP Resource — monthly summary (#21)
+# MCP Resource — monthly summary 
 # ---------------------------------------------------------------------------
 
 @mcp.resource(
@@ -692,6 +692,7 @@ async def monthly_summary_resource(session_token: str) -> dict:
                 "last_month_total": round(last_month_total, 2),
                 "pct_change_vs_last_month": round(pct_change, 1),
                 "monthly_budget": monthly_limit,
+                "monthly_limit": monthly_limit,
                 "remaining_budget": round(remaining_budget, 2) if remaining_budget is not None else None,
                 "expense_count": len(this_month),
             }

@@ -94,72 +94,78 @@ async def get_gold_price(currency: str = "INR") -> dict | str:
     currency = currency.strip().upper()
 
     try:
-        # Frankfurter doesn't support XAU directly, so we convert via
-        # a known gold price API or use a two-step conversion.
-        # Strategy: get EUR rate, then convert gold spot price.
-        # Actually, let's use a direct gold price endpoint.
         async with httpx.AsyncClient(timeout=10.0) as client:
-            # Try to get 1 XAU in the target currency
-            # Frankfurter doesn't support XAU, so we use a free gold API
-            resp = await client.get(
-                "https://api.gold-api.com/price/XAU",
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                price_usd = data.get("price_gram_24k") or data.get("price")
-                if price_usd and currency == "USD":
-                    return {
-                        "metal": "Gold (XAU)",
-                        "price_per_troy_oz": round(price_usd, 2) if data.get("price") else None,
-                        "price_per_gram_24k": round(price_usd, 2) if data.get("price_gram_24k") else None,
-                        "currency": "USD",
-                        "source": "gold-api.com",
-                    }
+            gold_usd_per_oz = None
+            price_date = "today"
+            gold_source = None
 
-            # Fallback: use a hardcoded approximate approach with Frankfurter
-            # Get USD to target currency rate
-            fx_resp = await client.get(
-                f"{FRANKFURTER_BASE}/latest",
-                params={"from": "USD", "to": currency},
-            )
-            fx_resp.raise_for_status()
-            fx_data = fx_resp.json()
-            fx_rate = fx_data.get("rates", {}).get(currency)
-
-            if fx_rate is None:
-                return f"Error: Currency '{currency}' not supported."
-
-            # Approximate gold price in USD per troy ounce (updated periodically)
-            # This is a reference price; users should check live sources for trading.
-            gold_usd_per_oz = 2650.0  # Approximate mid-2026 price
-
-            # Try to get a better price from a free API
+            # 1. Try free live gold spot API
             try:
-                gold_resp = await client.get(
-                    "https://api.metalpriceapi.com/v1/latest",
-                    params={"api_key": "demo", "base": "XAU", "currencies": "USD"},
-                    timeout=5.0,
-                )
-                if gold_resp.status_code == 200:
-                    gold_data = gold_resp.json()
-                    if gold_data.get("success") and "rates" in gold_data:
-                        usd_per_xau = gold_data["rates"].get("USD", gold_usd_per_oz)
-                        gold_usd_per_oz = usd_per_xau
+                resp = await client.get("https://api.gold-api.com/price/XAU")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    live_price = data.get("price") or data.get("price_gram_24k")
+                    if live_price:
+                        gold_usd_per_oz = float(live_price)
+                        gold_source = "gold-api.com"
             except Exception:
-                pass  # Use approximate price
+                pass
+
+            # 2. Try secondary live gold API if first failed
+            if gold_usd_per_oz is None:
+                try:
+                    gold_resp = await client.get(
+                        "https://api.metalpriceapi.com/v1/latest",
+                        params={"api_key": "demo", "base": "XAU", "currencies": "USD"},
+                        timeout=5.0,
+                    )
+                    if gold_resp.status_code == 200:
+                        gold_data = gold_resp.json()
+                        if gold_data.get("success") and "rates" in gold_data:
+                            gold_usd_per_oz = float(gold_data["rates"].get("USD", 0))
+                            if gold_usd_per_oz > 0:
+                                gold_source = "metalpriceapi.com"
+                except Exception:
+                    pass
+
+            # 3. Fallback to approximate baseline if external APIs are unreachable
+            if not gold_usd_per_oz or gold_usd_per_oz <= 0:
+                gold_usd_per_oz = 2650.0  # Approximate baseline price
+                gold_source = "Approximate spot baseline"
+
+            # 4. Currency conversion rate from USD
+            if currency == "USD":
+                fx_rate = 1.0
+                fx_date = None
+            else:
+                fx_resp = await client.get(
+                    f"{FRANKFURTER_BASE}/latest",
+                    params={"from": "USD", "to": currency},
+                )
+                fx_resp.raise_for_status()
+                fx_data = fx_resp.json()
+                fx_rate = fx_data.get("rates", {}).get(currency)
+                if fx_rate is None:
+                    return f"Error: Currency '{currency}' not supported."
+                fx_date = fx_data.get("date")
 
             price_in_currency = gold_usd_per_oz * fx_rate
             price_per_gram = price_in_currency / 31.1035  # troy oz to grams
+
+            source_desc = f"{gold_source}"
+            if currency != "USD":
+                source_desc += " + European Central Bank FX (via Frankfurter)"
 
             return {
                 "metal": "Gold (XAU)",
                 "price_per_troy_oz": round(price_in_currency, 2),
                 "price_per_gram_24k": round(price_per_gram, 2),
                 "currency": currency,
+                "usd_gold_spot": round(gold_usd_per_oz, 2),
                 "usd_fx_rate": fx_rate,
-                "date": fx_data.get("date", "unknown"),
-                "source": "European Central Bank (exchange rate) + approximate gold spot",
-                "disclaimer": "Approximate price for informational purposes only. Not investment advice.",
+                "date": fx_date or "live",
+                "source": source_desc,
+                "disclaimer": "Factual price data for informational purposes only. Not investment advice.",
             }
     except httpx.ConnectError:
         return "Error: Unable to connect to price service."

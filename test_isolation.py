@@ -570,3 +570,134 @@ def test_query_expenses_aggregate():
     # Food total should be 300, transport 150
     assert result[0]["category"] == "food"
     assert result[0]["total"] == 300.0
+
+
+# ---------------------------------------------------------------------------
+# Tests: Financial Insights Server Tools
+# ---------------------------------------------------------------------------
+
+def test_financial_exchange_rate():
+    """Test exchange rate lookups including same-currency edge case."""
+    from financial_insights_server import get_exchange_rate
+
+    # Same currency fast-path
+    res_same = _run(get_exchange_rate("USD", "USD"))
+    assert isinstance(res_same, dict)
+    assert res_same["rate"] == 1.0
+
+    # Cross currency
+    res_fx = _run(get_exchange_rate("USD", "INR"))
+    assert isinstance(res_fx, dict)
+    assert res_fx["rate"] > 0
+    assert res_fx["from"] == "USD"
+    assert res_fx["to"] == "INR"
+
+
+def test_financial_gold_price():
+    """Test gold spot price calculation for USD and foreign currency."""
+    from financial_insights_server import get_gold_price
+
+    # Test USD
+    res_usd = _run(get_gold_price("USD"))
+    assert isinstance(res_usd, dict)
+    assert res_usd["currency"] == "USD"
+    assert res_usd["price_per_troy_oz"] > 0
+    assert res_usd["usd_fx_rate"] == 1.0
+
+    # Test INR
+    res_inr = _run(get_gold_price("INR"))
+    assert isinstance(res_inr, dict)
+    assert res_inr["currency"] == "INR"
+    assert res_inr["price_per_troy_oz"] > 0
+    assert res_inr["usd_fx_rate"] > 1.0
+
+
+# ---------------------------------------------------------------------------
+# Tests: Monthly Summary MCP Resource
+# ---------------------------------------------------------------------------
+
+def test_monthly_summary_resource_template_registered():
+    """Verify that expense://summary/{session_token}/monthly is registered on the MCP server."""
+    import expense_mcp_server as srv
+    templates = [t.uri_template for t in srv.mcp._resource_manager.list_templates()]
+    assert "expense://summary/{session_token}/monthly" in templates, (
+        f"Resource template not found in {templates}"
+    )
+
+
+def test_monthly_summary_resource_data():
+    """Verify monthly summary resource returns correct spend, count, and budget limit."""
+    import expense_mcp_server as srv
+    uid = _create_user("summary_user")
+    token = _create_token(uid)
+
+    # Set budget of 5000
+    _run(srv.set_budget(token, 5000.0))
+
+    # Add two expenses for current month
+    _run(srv.add_expense(token, 250.0, "food", "lunch", date.today().isoformat()))
+    _run(srv.add_expense(token, 750.0, "groceries", "market", date.today().isoformat()))
+
+    # Read the resource
+    result = _run(srv.monthly_summary_resource(token))
+    assert isinstance(result, dict)
+    assert result["total_spent"] == 1000.0
+    assert result["expense_count"] == 2
+    assert result["monthly_limit"] == 5000.0
+    assert result["monthly_budget"] == 5000.0
+    assert result["remaining_budget"] == 4000.0
+
+
+def test_monthly_summary_resource_invalid_token():
+    """Verify invalid token returns error dictionary."""
+    import expense_mcp_server as srv
+    result = _run(srv.monthly_summary_resource("invalid_or_expired_token_xyz"))
+    assert isinstance(result, dict)
+    assert "error" in result
+
+
+def test_app_get_monthly_summary_client():
+    """Verify app.py's get_monthly_summary helper parses JSON and raises on error."""
+    from unittest.mock import AsyncMock, patch
+    from mcp.types import TextResourceContents
+    from pydantic_ai.mcp import FastMCPClient
+    from app import get_monthly_summary
+
+    fake_contents = [
+        TextResourceContents(
+            uri="expense://summary/tok/monthly",
+            mime_type="application/json",
+            text='{"total_spent": 500.0, "expense_count": 3, "monthly_limit": 2000.0, "remaining_budget": 1500.0}',
+        )
+    ]
+    with patch("app.FastMCPClient") as mock_cls:
+        mock_instance = AsyncMock()
+        mock_instance.read_resource.return_value = fake_contents
+        mock_instance.__aenter__.return_value = mock_instance
+        mock_instance.__aexit__.return_value = None
+        mock_cls.return_value = mock_instance
+
+        summary = get_monthly_summary("tok")
+        assert summary["total_spent"] == 500.0
+        assert summary["expense_count"] == 3
+        assert summary["monthly_limit"] == 2000.0
+
+    fake_err = [
+        TextResourceContents(
+            uri="expense://summary/tok/monthly",
+            mime_type="application/json",
+            text='{"error": "Invalid session token."}',
+        )
+    ]
+    with patch("app.FastMCPClient") as mock_cls:
+        mock_instance = AsyncMock()
+        mock_instance.read_resource.return_value = fake_err
+        mock_instance.__aenter__.return_value = mock_instance
+        mock_instance.__aexit__.return_value = None
+        mock_cls.return_value = mock_instance
+
+        with pytest.raises(ValueError, match="Invalid session token"):
+            get_monthly_summary("tok")
+
+
+

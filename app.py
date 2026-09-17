@@ -1,8 +1,11 @@
+import asyncio
+import json
 import streamlit as st
-from sqlalchemy import select
 
-from database import db_session, init_db
+from config import get_settings
+from database import init_db
 from llm_client import stream_chat_response
+from pydantic_ai.mcp import FastMCPClient
 from schemas import ChatMessage, Role
 
 st.set_page_config(page_title="Expense Tracker", page_icon="💰", layout="wide")
@@ -92,46 +95,60 @@ if st.session_state.user_id is None:
                         st.error(str(exc))
     st.stop()
 
+async def _fetch_monthly_summary_mcp(session_token: str) -> dict:
+    """Fetch monthly spending summary from the expense MCP server resource."""
+    settings = get_settings()
+    client = FastMCPClient(settings.mcp_server_url)
+    async with client:
+        uri = f"expense://summary/{session_token}/monthly"
+        contents = await client.read_resource(uri)
+        if not contents:
+            raise RuntimeError("Empty response from monthly summary resource.")
+        data = json.loads(contents[0].text)
+        if "error" in data:
+            raise ValueError(data["error"])
+        return data
+
+
+def get_monthly_summary(session_token: str) -> dict:
+    """Synchronous wrapper around _fetch_monthly_summary_mcp using asyncio.run."""
+    return asyncio.run(_fetch_monthly_summary_mcp(session_token))
+
+
 # ---------------------------------------------------------------------------
 # Main chat interface (user is logged in)
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.header(f"👤 {st.session_state.username}")
 
-    # Feature #21: Monthly summary from MCP resource (displayed below).
-    # For now, we read summary data via a direct helper call since the
-    # MCP resource client requires an async context.  A full production
-    # implementation would use the MCP client's read_resource method.
     try:
-        from expense_mcp_server import resolve_session, SessionLocal, Expense, Budget
-        from datetime import datetime, timezone
-        user_id = resolve_session(st.session_state.session_token)
-        with SessionLocal() as _sess:
-            today = datetime.now(timezone.utc).date()
-            first_of_month = today.replace(day=1)
-            month_expenses = _sess.scalars(
-                select(Expense).where(
-                    Expense.user_id == user_id,
-                    Expense.date >= first_of_month,
-                    Expense.date <= today,
-                )
-            ).all()
-            total_spent = sum(e.amount for e in month_expenses)
-            expense_count = len(month_expenses)
-
-            budget_row = _sess.scalars(
-                select(Budget).where(Budget.user_id == user_id)
-            ).first()
+        summary = get_monthly_summary(st.session_state.session_token)
+        expense_count = summary.get("expense_count", 0)
+        total_spent = summary.get("total_spent", 0.0)
+        monthly_limit = (
+            summary.get("monthly_limit")
+            if summary.get("monthly_limit") is not None
+            else summary.get("monthly_budget")
+        )
 
         col1, col2 = st.columns(2)
         col1.metric("Expenses", expense_count)
         col2.metric("Spent", f"₹{total_spent:,.0f}")
 
-        if budget_row:
-            remaining = budget_row.monthly_limit - total_spent
+        if monthly_limit is not None:
+            remaining = summary.get("remaining_budget", monthly_limit - total_spent)
             st.metric("Remaining Budget", f"₹{remaining:,.0f}")
-            progress = min(total_spent / budget_row.monthly_limit, 1.0) if budget_row.monthly_limit > 0 else 0
-            st.progress(progress, text=f"{progress:.0%} of ₹{budget_row.monthly_limit:,.0f}")
+            raw_progress = (total_spent / monthly_limit) if monthly_limit > 0 else 0.0
+            progress = max(0.0, min(raw_progress, 1.0))
+            st.progress(progress, text=f"{progress:.0%} of ₹{monthly_limit:,.0f}")
+    except ValueError as exc:
+        # Session expired or invalid — auto logout and redirect to login
+        st.session_state.user_id = None
+        st.session_state.username = None
+        st.session_state.session_token = None
+        st.session_state.messages = []
+        st.warning(f"Session ended: {exc}. Please log in again.")
+        st.rerun()
     except Exception:
         st.caption("Summary unavailable")
 
