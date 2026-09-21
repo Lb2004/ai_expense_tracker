@@ -6,13 +6,8 @@ DB engine so it can run independently of the Streamlit app.  All
 mutating/querying tools use session_token for auth — no raw user_id
 accepted from callers.
 
-Known limitation: The server binds to 127.0.0.1 by default
-(see MCPServer.run_streamable_http_async), which is intentional for
-this POC — it should NOT be exposed on 0.0.0.0 without adding
-proper transport-level authentication.
-
 Run:  python expense_mcp_server.py
-Test: open MCP Inspector at http://127.0.0.1:8001/mcp
+Test: open MCP Inspector at http://localhost:8001/mcp
 """
 
 import asyncio
@@ -21,6 +16,7 @@ import secrets
 from datetime import date, datetime, timedelta, timezone
 
 import sqlparse
+from sqlparse import tokens as T
 import bcrypt as _bcrypt_lib
 from pydantic import BaseModel
 from sqlalchemy import create_engine, event, select, text
@@ -29,9 +25,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from mcp.server.mcpserver import MCPServer
 from shared_models import Base, Budget, Expense, User, UserSession, _utcnow
 
-# ---------------------------------------------------------------------------
 # Database setup (self-contained — its own engine, separate from app's)
-# ---------------------------------------------------------------------------
 
 DATABASE_URL = "sqlite:///./expenses.db"
 
@@ -53,11 +47,7 @@ def _enable_fk(dbapi_conn, _rec):
 # Create tables on import (idempotent).
 Base.metadata.create_all(bind=engine)
 
-
-# ---------------------------------------------------------------------------
 # Password helpers (bcrypt)
-# ---------------------------------------------------------------------------
-
 
 def hash_password(plain: str) -> str:
     """Hash a plaintext password with bcrypt.  Never stores or logs plain."""
@@ -68,11 +58,7 @@ def verify_password(plain: str, hashed: str) -> bool:
     """Verify a plaintext password against a bcrypt hash."""
     return _bcrypt_lib.checkpw(plain.encode("utf-8"), hashed.encode("ascii"))
 
-
-# ---------------------------------------------------------------------------
 # Session helpers
-# ---------------------------------------------------------------------------
-
 
 def create_session(user_id: int) -> str:
     """Create a new session token for a user.  Returns the token string.
@@ -113,14 +99,8 @@ def resolve_session(token: str) -> int:
         return sess.user_id
 
 
-# ---------------------------------------------------------------------------
-# User signup / login (internal, NOT MCP-exposed) — Fix #1, #2
-# ---------------------------------------------------------------------------
+# User signup / login (internal, NOT MCP-exposed)
 # These functions are called ONLY from app.py's login flow, never via MCP.
-# Fix #1: create_user_session was previously decorated with @mcp.tool(),
-# making it callable by the agent with an arbitrary user_id and no password.
-# It is now a plain internal function and must NEVER appear in tools/list.
-
 
 def signup_user(username: str, password: str) -> tuple[int, str]:
     """Register a new user with bcrypt-hashed password.  Returns (user_id, token).
@@ -196,34 +176,55 @@ def validate_sql(raw_sql: str) -> str:
     Fix #3: queries now run against the temp VIEW 'my_expenses', not the
     raw 'expenses' table.  This function validates that the query only
     references 'my_expenses' and uses allowed columns.
+    Uses sqlparse's parsed token stream to inspect structure rather than
+    raw text regex, avoiding edge cases with escaped quotes and literals.
     """
-    # Parse with sqlparse
-    parsed = sqlparse.parse(raw_sql.strip())
+    clean_sql = raw_sql.strip()
+    parsed = sqlparse.parse(clean_sql)
     if not parsed:
         raise ValueError("Empty or unparsable SQL.")
+
+    # Multi-statement injection check: sqlparse splits on semicolons
+    if len(parsed) > 1:
+        raise ValueError("Multiple statements are not allowed.")
+
     stmt = parsed[0]
 
     # Must be a SELECT statement
     if stmt.get_type() != "SELECT":
         raise ValueError("Only SELECT queries are allowed.")
 
-    sql_lower = raw_sql.lower()
+    tokens = list(stmt.flatten())
+    non_ws_tokens = [t for t in tokens if not t.is_whitespace]
 
-    # Check for dangerous keywords
-    for kw in _DANGEROUS_KW:
-        if re.search(rf"\b{kw}\b", sql_lower):
-            raise ValueError(f"Forbidden keyword: {kw}")
+    # Check for semicolons as structural tokens (outside string literals and comments)
+    for t in non_ws_tokens:
+        if t.ttype in T.Punctuation and t.value == ";":
+            raise ValueError("Multiple statements are not allowed.")
 
-    # Check for semicolons (multi-statement injection)
-    if ";" in raw_sql:
-        raise ValueError("Multiple statements are not allowed.")
+    identifiers = set()
 
-    # Strip quoted string literals before identifier extraction so that
-    # string values like 'food' don't get flagged as unknown identifiers.
-    stripped_sql = re.sub(r"'[^']*'", "", sql_lower)
+    for t in non_ws_tokens:
+        # Ignore comments and string/numeric literals completely.
+        # This prevents escaped quotes ('') or keywords inside strings/comments
+        # from being confused with actual SQL structure.
+        if t.ttype in T.Comment or t.ttype in T.Literal:
+            continue
 
-    # Extract all identifiers and check against allowlist
-    identifiers = set(_IDENT_RE.findall(stripped_sql))
+        val_lower = t.value.lower()
+
+        # Check for dangerous keywords on structural tokens (keywords, names, etc.)
+        for word in val_lower.split():
+            clean_word = word.strip("`\"'[];(),")
+            if clean_word in _DANGEROUS_KW:
+                raise ValueError(f"Forbidden keyword: {clean_word}")
+
+        # Extract identifiers (Token.Name, Token.Name.Builtin, or quoted symbols)
+        if t.ttype in T.Name or t.ttype is T.Literal.String.Symbol:
+            clean_ident = val_lower.strip("`\"'[];(),")
+            if clean_ident:
+                identifiers.add(clean_ident)
+
     # Remove SQL keywords, aggregates, and known safe tokens
     sql_keywords = {
         "select", "from", "where", "and", "or", "not", "in", "between",
@@ -247,7 +248,7 @@ def validate_sql(raw_sql: str) -> str:
             f"Allowed columns: {', '.join(sorted(ALLOWED_COLUMNS))}"
         )
 
-    return raw_sql.strip()
+    return clean_sql
 
 
 # ---------------------------------------------------------------------------

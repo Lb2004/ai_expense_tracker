@@ -6,16 +6,10 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from config import get_settings
 
-# shared_models.py is dependency-free, so this import is safe at the
-# top level — no circular-import workaround needed.  (Fix #17: the old
-# local import inside init_db() was required because models.py used to
-# import Base from database.py, creating a cycle.  shared_models.py
-# defines its own Base, breaking the cycle.)
-from shared_models import Base, Budget, Expense, User, UserSession  # noqa: F401
+from shared_models import Base
 
 
 _url = get_settings().database_url
-# Streamlit reruns on a different thread than the one that opened SQLite.
 _connect_args = {"check_same_thread": False} if _url.startswith("sqlite") else {}
 engine = create_engine(_url, connect_args=_connect_args)
 SessionLocal = sessionmaker(

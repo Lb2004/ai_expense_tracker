@@ -382,6 +382,59 @@ def test_query_expenses_column_allowlist():
 
 
 # ---------------------------------------------------------------------------
+# Test: query_expenses — escaped quotes and keywords in string literals
+# ---------------------------------------------------------------------------
+
+def test_query_expenses_escaped_quotes_and_literals():
+    """Queries with escaped quotes ('') and keywords inside string literals work.
+
+    Under the old regex-based approach, string literals containing keywords
+    like 'drop' (e.g. 'let''s drop by') failed because the keyword blocklist
+    checked raw text.  Walking sqlparse's token tree properly isolates string
+    literals from actual SQL keywords and identifiers.
+    """
+    uid = _create_user("alice_quotes")
+    token = _create_token(uid)
+
+    # Add expenses with apostrophe and keyword in description
+    _run(add_expense(token, 45.0, "food", "Chef's drop-in special", date.today().isoformat()))
+    _run(add_expense(token, 120.0, "dining", "McDonald's dinner", date.today().isoformat()))
+
+    # Query matching the escaped quote and keyword in description
+    result = _run(query_expenses(
+        token, "SELECT id, amount, description FROM my_expenses WHERE description = 'Chef''s drop-in special'"
+    ))
+    assert isinstance(result, list), f"Expected list, got {result}"
+    assert len(result) == 1
+    assert result[0]["amount"] == 45.0
+    assert result[0]["description"] == "Chef's drop-in special"
+
+    # Also test McDonald''s
+    result2 = _run(query_expenses(
+        token, "SELECT id, amount, description FROM my_expenses WHERE description = 'McDonald''s dinner'"
+    ))
+    assert isinstance(result2, list), f"Expected list, got {result2}"
+    assert len(result2) == 1
+    assert result2[0]["amount"] == 120.0
+    assert result2[0]["description"] == "McDonald's dinner"
+
+
+def test_validate_sql_ignores_keyword_inside_literal():
+    """A dangerous keyword as a standalone word inside a string literal
+    must not trigger rejection — it's data, not SQL syntax."""
+    uid = _create_user("bob_literal")
+    token = _create_token(uid)
+    _run(add_expense(token, 10.0, "misc", "planning to drop by the store", date.today().isoformat()))
+
+    # Should NOT raise — "drop" here is inside a string literal, not SQL syntax
+    result = _run(query_expenses(
+        token, "SELECT id, amount FROM my_expenses WHERE description = 'planning to drop by the store'"
+    ))
+    assert isinstance(result, list)
+    assert len(result) == 1
+
+
+# ---------------------------------------------------------------------------
 # Test: can_i_afford basic
 # ---------------------------------------------------------------------------
 
